@@ -1,60 +1,81 @@
 # Author: Elvis Dohmatob <gmdopp@gmail.com>
 
-import sys
+from math import sqrt
 import numpy as np
+from scipy import spatial
 import matplotlib.pyplot as plt
 from sklearn.utils import check_random_state, gen_batches
-from sklearn.utils.testing import assert_array_equal, assert_equal
+from sklearn.utils.testing import assert_array_equal, assert_almost_equal
 import torch
 from torch import nn
 from bregman import sinkhorn_epsilon_scaling, _to_var
 from mlp import MLP
 
 
-def _compute_ground_cost(x, y, p=2):
-    x, y = map(_to_var, (x, y))
-    if p == 2.:
-        n = x.size(0)
-        m = y.size(0)
-        x2 = (x ** 2).sum(1)
-        y2 = (y ** 2).sum(1).view(1, m)
-        ground_cost = x2.repeat(1, m)
-        ground_cost.add_(y2.repeat(n, 1))
-        ground_cost.add_(-2 * x.mm(y.t()))
-    elif p == 1:
-        x = x.data.numpy()
-        y = y.data.numpy()
-        x = x.reshape(x.shape + (1,))
-        y = y.reshape(y.shape + (1,)).transpose((2, 1, 0))
-        ground_cost = _to_var(np.abs(x - y).sum(axis=1),
-                              requires_grad=True)
-    elif p == "pearsonr":
-        from utils import compute_confusion
-        x = x.data.numpy()
-        y = y.data.numpy()
-        ground_cost = -compute_confusion(x, y, scorer="pearsonr")
+def cdist(x, y, metric="sqeuclidean", p=None, backend="torch"):
+    metric = metric.lower()
+    backend = backend.lower()
+    if backend == "torch":  # and torch.cuda.is_available():
+        if metric == "sqeuclidean":
+            if y is None:
+                y = x
+            x, y = map(_to_var, (x, y))
+            n = x.size(0)
+            m = y.size(0)
+            x2 = (x ** 2).sum(1)
+            y2 = (y ** 2).sum(1).view(1, m)
+            ground_cost = x2.repeat(1, m)
+            ground_cost.add_(y2.repeat(n, 1))
+            ground_cost.add_(-2 * x.mm(y.t()))
+        else:
+            raise NotImplementedError(metric)
+    elif backend == "custom":
+        if metric == "sqeuclidean":
+            if isinstance(x, torch.autograd.Variable):
+                x = x.data.numpy()
+            if isinstance(y, torch.autograd.Variable):
+                y = y.data.numpy()
+            n = len(x)
+            m = len(y)
+            ground_cost = np.tile((x ** 2).sum(1)[:, None], (1, m))
+            ground_cost += np.tile((y ** 2).sum(1), (n, 1))
+            ground_cost -= 2. * np.dot(x, y.T)
+            ground_cost = _to_var(ground_cost, requires_grad=True)
+    elif backend == "scipy":
+        if isinstance(x, torch.autograd.Variable):
+            x = x.data.numpy()
+        if isinstance(y, torch.autograd.Variable):
+            y = y.data.numpy()
+        if y is None:
+            ground_cost = spatial.distance.pdist(x, y, metric=metric, p=p)
+        else:
+            ground_cost = spatial.distance.cdist(x, y, metric=metric)
         ground_cost = _to_var(ground_cost, requires_grad=True)
     else:
-        raise NotImplementedError(
-            "Ground cost not implemented for p=%s" % p)
-    return ground_cost.float()
+        raise NotImplementedError(backend)
+    return ground_cost
 
 
-def test_compute_ground_cost(random_state=42):
+def test_cdist(random_state=42):
     rng = check_random_state(random_state)
-    x = _to_var(torch.from_numpy(rng.randn(10, 3)))
-    y = _to_var(torch.from_numpy(rng.randn(12, 3)))
-    cost = _compute_ground_cost(x, y).data.numpy()
-    for i, xi in enumerate(x):
-        for j, yj in enumerate(y):
-            assert_equal(cost[i, j], sum((xi - yj) ** 2))
+    x = rng.randn(10, 3)
+    y = rng.randn(12, 3)
+    for metric, p in zip(["sqeuclidean", "cityblock"], [2, 1]):
+        for backend in ["torch", "scipy", "custom"]:
+            if backend != "scipy" and metric != "sqeuclidean":
+                continue
+            cost = cdist(x, y, backend=backend, metric=metric,
+                         p=p).data.numpy()
+            for i, xi in enumerate(x):
+                for j, yj in enumerate(y):
+                    assert_almost_equal(cost[i, j], sum(np.abs(xi - yj) ** p))
 
 
-def sinkhorn(x=None, y=None, ground_cost=None, mu=None, nu=None, p=2,
-             epsilon=1., n_iter=100, n_inner_iter=10, tol=1e-4,
-             log=False, **kwargs):
+def sinkhorn(x=None, y=None, ground_cost=None, mu=None, nu=None,
+             metric="sqeuclidean", epsilon=1., tol=1e-4, n_iter=100,
+             n_inner_iter=10, log=False, **kwargs):
     if ground_cost is None:
-        ground_cost = _compute_ground_cost(x, y, p=p)
+        ground_cost = cdist(x, y, metric=metric)
     out = sinkhorn_epsilon_scaling(
         mu, nu, ground_cost, epsilon, tol=tol, log=log, n_iter=n_iter,
         n_inner_iter=n_inner_iter, **kwargs)
@@ -82,7 +103,7 @@ def test_job_assignment():
     ground_cost = np.array([[82, 83, 69, 92],
                             [77, 37, 49, 92],
                             [11, 69, 5, 86],
-                            [8, 9, 98, 23.]], dtype=np.float32)
+                            [8, 9, 98, 23.]], dtype=np.double)
     ground_cost = _to_var(torch.from_numpy(ground_cost))
     for epsilon in np.logspace(-5, 0, num=6):
         print(epsilon)
@@ -93,15 +114,15 @@ def test_job_assignment():
 
 
 class SinkhornLoss(nn.Module):
-    def __init__(self, L=10, epsilon=1., p=2):
+    def __init__(self, L=10, epsilon=1., metric="sqeuclidean"):
         super(SinkhornLoss, self).__init__()
         self.L = L
         self.epsilon = epsilon
-        self.p = p
+        self.metric = metric
 
     def forward(self, x, y):
         e, _ = sinkhorn(x=x, y=y, epsilon=self.epsilon, n_iter=self.L,
-                        p=self.p, verbose=1, n_inner_iter=1)
+                        metric=self.metric, verbose=1, n_inner_iter=1)
         return e
 
 
@@ -128,7 +149,7 @@ def sinkhorn_experiments():
 
     epsilon = .1
     n_iter = 1
-    _, gamma, errs = sinkhorn(x=x.T, y=y.T, epsilon=epsilon, p=2,
+    _, gamma, errs = sinkhorn(x=x.T, y=y.T, epsilon=epsilon,
                               n_iter=n_iter, log=True)
     gamma = gamma.data.numpy()
     if len(errs) > 1 and 0:
@@ -181,7 +202,7 @@ def mnist_experiments(semi_sup=False):
     # rescale the data, use the traditional train/test split
     images, labels = mnist.data, mnist.target.astype(np.int)
     images = images / 255.
-    if False:
+    if True:
         msk = np.isin(labels, [0, 3, 6, 8])
         images = images[msk]
         labels = labels[msk]
@@ -194,8 +215,9 @@ def mnist_experiments(semi_sup=False):
     image_shape = (28, 28)
     image_size = np.prod(image_shape)
     batch_size = 200
-    n_epochs = 5
+    n_epochs = 20
 
+    # MLP generator network
     low_dim = 2
     generator_hidden_dims = (256, 512)
     w_dim = low_dim
@@ -203,20 +225,29 @@ def mnist_experiments(semi_sup=False):
         y_dim = len(np.unique(labels))
         w_dim += y_dim
     generator = MLP((w_dim,) + generator_hidden_dims + (image_size,),
-                    activation="relu", no_output_activation=True)
+                    activation="relu")
+    generator.double()
     print(generator)
 
-    sinkhorn_loss = SinkhornLoss(epsilon=.1, L=10)
+    # Sinkhorn loss network
+    sinkhorn_loss = SinkhornLoss(epsilon=1000., L=10, metric="sqeuclidean")
 
+    # Laten space sampler
     def sample_noise(size):
-        return _to_var(torch.rand(size, low_dim))
+        return _to_var(torch.rand(size, low_dim)).double()
 
+    # misc
     n_iter = len(images) // batch_size
     print_freq = 10
     print_freq = min(print_freq, n_iter)
     optimizer = torch.optim.Adam(generator.parameters(), lr=1e-2)
     losses = []
     batches = list(gen_batches(len(images), batch_size))
+
+    def set_regu(t):
+        sinkhorn_loss.epsilon = 10. / sqrt(t)
+
+    # training loop proper
     for epoch in range(n_epochs):
         print("\nEpoch %02i/%02i" % (epoch + 1, n_epochs))
         perm = rng.permutation(len(images))
@@ -225,10 +256,10 @@ def mnist_experiments(semi_sup=False):
         for it, batch in enumerate(batches):
             # sample
             images_batch = images[batch]
-            images_batch = _to_var(torch.from_numpy(images_batch)).float()
+            images_batch = _to_var(torch.from_numpy(images_batch))
             if semi_sup:
                 labels_batch = one_hot.transform(labels[batch][:, None])
-                labels_batch = _to_var(labels_batch.toarray()).float()
+                labels_batch = _to_var(labels_batch.toarray())
             else:
                 labels_batch = None
 
@@ -243,6 +274,7 @@ def mnist_experiments(semi_sup=False):
             fake = generator(w_batch)
 
             # compute loss
+            set_regu(len(losses) + 1)
             loss = sinkhorn_loss(fake, images_batch)
             losses.append(loss.data[0])
 
@@ -253,33 +285,34 @@ def mnist_experiments(semi_sup=False):
 
             # report progress
             if it % print_freq == 0:
-                print("Batch [%03i -- %03i]/%03i loss=%g" % (
-                    it, it + print_freq, n_iter, loss.data[0]))
+                print(
+                    "Batch [%05i -- %05i]/%05i reg=%g, Sinkhorn loss=%g" % (
+                        it * batch_size, (it + print_freq) * batch_size,
+                        len(images), sinkhorn_loss.epsilon, loss.data[0]))
 
         # plot real images
         show_examples(images[:100], image_shape=image_shape, n_cols=10)
         plt.title("Epoch %i/%i: true samples" % (epoch, n_epochs))
         plt.gray()
+        plt.tight_layout()
 
         # draw batch of noise vectors from latent space
         generator.eval()
         noise = sample_noise(100)
         if semi_sup:
             labels_fake = one_hot.transform(labels[:100][:, None])
-            labels_fake = _to_var(labels_fake.toarray()).float()
+            labels_fake = _to_var(labels_fake.toarray())
             w = torch.cat((noise, labels_fake), dim=1)
         else:
             w = noise
         images_fake = generator(w)
         show_examples(images_fake.data.numpy(), n_cols=10,
                       image_shape=image_shape)
-        plt.title("Epoch %i/%i: fake samples" % (epoch, n_epochs))
-        plt.show()
+        plt.title("Epoch %i/%i: fake samples" % (epoch + 1, n_epochs))
+        plt.tight_layout()
 
         # plot convergence curve
         plt.figure()
-        if epoch > 0:
-            plt.axvline(len(losses), linestyle="--")
         plt.plot(losses, linewidth=2)
         plt.xlabel("mini-batches")
         plt.ylabel("training loss")
